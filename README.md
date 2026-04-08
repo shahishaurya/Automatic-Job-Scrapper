@@ -1,4 +1,5 @@
 🚀 Multi-User Job Intelligence Suite (ETL)
+
 A robust, automated job-scraping and reporting engine. This system performs a full ETL (Extract, Transform, Load) cycle: it extracts live job data from LinkedIn and Naukri, transforms it into structured SQLite databases, and delivers a daily Excel summary to multiple users via email.
 
 🌟 Key Features
