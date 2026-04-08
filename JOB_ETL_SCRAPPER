@@ -1,0 +1,391 @@
+import sqlite3
+import pandas as pd
+import os
+import smtplib
+import time
+from datetime import datetime
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import time
+from datetime import datetime
+users_config = {
+    "User_1": {
+        "DB_LINKEDIN": "linkedin_user1.db",
+        "DB_NAUKRI": "naukri_user1.db",
+        "GMAIL_USER": "user1@gmail.com",
+        "GMAIL_PASS": "user1 email App Password",
+        "KEYWORDS": ["Py", "Python", "PySpark", "SQL", "Data Engineer", "AWS", "Palantir", "ETL", "Data Warehouse","Data Pipeline", "Big Data", "Cloud"],
+        "LOCATIONS": ["Bangalore", "Bengaluru", "Bangalore Urban", "Bangalore Rural","Remote"]
+    },
+    "User_2": {
+        "DB_LINKEDIN": "linkedin_user2.db",
+        "DB_NAUKRI": "naukri_user2.db",
+        "GMAIL_USER": "user2@gmail.com",
+        "GMAIL_PASS": "user2 email App Password",
+        "KEYWORDS": ["Py", "Data Operations Analyst", "Financial Data Analyst", "Business Intelligence Analyst", "Finance Operations Analyst", "Revenue Operations Analyst",
+                     "Accounts Payable Analyst", "SQL", "Python", "Power BI", "Tableau", "Excel", "Advanced Excel","Macros", "VBA", "VBA Macros", "DAX", "Power Query",
+                     "Order to Cash", "Procure to Pay", "Financial Reconciliation", "Billing Operations", "Audit Compliance", "TAT Optimization",
+                      "Data Analyst", "Data Visualization", "Data Reporting"],
+        "LOCATIONS": ["Bangalore", "Bengaluru", "Bangalore Urban", "Bangalore Rural","Remote"]
+    }
+}
+CHROME_PROFILE = os.path.join(os.getcwd(), "AutomationProfile")
+def init_dbs(user_params):
+    """
+    Resets and initializes user-specific databases to ensure perfect column alignment.
+    Uses 'user_params' to find the correct file paths.
+    """
+    # Define the schemas for both sources
+    linkedin_schema = "(job_id TEXT PRIMARY KEY, title TEXT, company TEXT, location TEXT, url TEXT, date_scraped DATE)"
+    naukri_schema = "(job_id TEXT PRIMARY KEY, title TEXT, company TEXT, location TEXT, salary TEXT, experience TEXT, url TEXT, date_scraped DATE)"
+    
+    db_configs = [
+        (user_params["DB_LINKEDIN"], linkedin_schema),
+        (user_params["DB_NAUKRI"], naukri_schema)
+    ]
+    
+    for db_path, schema in db_configs:
+        with sqlite3.connect(db_path) as conn:
+            # WARNING: This drops existing data to align columns. 
+            # Remove the DROP line if you only want to create the table if missing.
+            conn.execute("DROP TABLE IF EXISTS jobs") 
+            conn.execute(f"CREATE TABLE jobs {schema}")
+            
+    print(f"[1] Databases for user initialized at: {user_params['DB_LINKEDIN']} and {user_params['DB_NAUKRI']}")
+def db_summary(user_params):
+    """
+    Prints a date-wise record count for the current user's databases.
+    """
+    print("\n" + "="*40)
+    print(f"   DATEWISE RECORD COUNT (Current Run)")
+    print("="*40)
+    
+    sources = [
+        ("LinkedIn", user_params["DB_LINKEDIN"]), 
+        ("Naukri", user_params["DB_NAUKRI"])
+    ]
+    
+    for src, db_path in sources:
+        try:
+            with sqlite3.connect(db_path) as conn:
+                query = "SELECT date_scraped, COUNT(*) as Count FROM jobs GROUP BY date_scraped ORDER BY date_scraped DESC"
+                df = pd.read_sql(query, conn)
+                
+                print(f"\n[{src} - {db_path}]")
+                if df.empty:
+                    print("No records found.")
+                else:
+                    print(df.to_string(index=False))
+        except Exception as e:
+            print(f"Could not generate summary for {src}: {e}")
+def historical_db_report(user_name, user_params):
+    """
+    Summarizes the total number of jobs collected for a specific user
+    across all dates stored in their unique databases.
+    """
+    print(f"\n--- Historical Database Summary for {user_name} at {datetime.now().strftime('%H:%M:%S')} ---")
+    
+    # 1. LinkedIn Historical Count
+    try:
+        with sqlite3.connect(user_params["DB_LINKEDIN"]) as conn:
+            # We use a simple COUNT(*) for speed
+            df = pd.read_sql("SELECT COUNT(*) as total FROM jobs", conn)
+            total = df['total'].iloc[0]
+            print(f"Total LinkedIn Jobs in {user_name}'s Repository: {total}")
+    except Exception as e:
+        print(f"Error reading LinkedIn History for {user_name}: {e}")
+
+    # 2. Naukri Historical Count
+    try:
+        with sqlite3.connect(user_params["DB_NAUKRI"]) as conn:
+            df = pd.read_sql("SELECT COUNT(*) as total FROM jobs", conn)
+            total = df['total'].iloc[0]
+            print(f"Total Naukri Jobs in {user_name}'s Repository: {total}")
+    except Exception as e:
+        print(f"Error reading Naukri History for {user_name}: {e}")
+        
+    print(f"All databases for {user_name} verified and closed.")
+def get_shared_driver():
+    """Opens Chrome ONCE for the entire session to prevent profile locking."""
+    # Clean up lock file from previous crashes
+    lock_file = os.path.join(CHROME_PROFILE, "SingletonLock")
+    if os.path.exists(lock_file):
+        try: os.remove(lock_file)
+        except: pass
+
+    options = webdriver.ChromeOptions()
+    options.add_argument(f"--user-data-dir={CHROME_PROFILE}")
+    options.add_argument("--profile-directory=Default")
+    options.add_experimental_option("detach", True) # Keep browser open at the end
+    
+    # Stealth
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+        "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+    })
+    return driver
+def scrape_linkedin(driver, user_params):
+    """
+    LinkedIn Scraper adapted for multiple users.
+    Uses 'user_params' to access specific DBs, Keywords, and Locations.
+    """
+    print(f"[2] Starting LinkedIn for Keywords: {user_params['KEYWORDS']}")
+    new_count = 0
+    wait = WebDriverWait(driver, 20)
+    
+    try:
+        # Loop through each keyword defined for this specific user
+        for kw in user_params["KEYWORDS"]:
+            # Loop through each location variation for this specific user
+            for loc in user_params["LOCATIONS"]:
+                
+                # Format URL with current keyword and location
+                url = f"https://www.linkedin.com/jobs/search/?keywords={kw.replace(' ', '%20')}&location={loc.replace(' ', '%20')}&f_TPR=r259200"
+                driver.get(url)
+                
+                # --- FLEXIBLE WAIT MODE ---
+                try:
+                    # Wait for any of the possible Title selectors to appear
+                    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 
+                        "h3.base-search-card__title, h3.job-search-card__title, .base-card__title")))
+                except Exception as e:
+                    print(f"[TIMEOUT] No cards for '{kw}' in '{loc}'. Skipping...")
+                    continue
+
+                # Small buffer for lazy rendering
+                time.sleep(2)
+                driver.execute_script("window.scrollBy(0, 800);")
+                time.sleep(1)
+
+                # Identify all job cards on the page
+                cards = driver.find_elements(By.CSS_SELECTOR, ".job-search-card, .base-card, .base-search-card")
+                
+                # Connect to this user's specific LinkedIn database
+                with sqlite3.connect(user_params["DB_LINKEDIN"]) as conn:
+                    for card in cards:
+                        try:
+                            # 1. Fallback chain for Title
+                            title = ""
+                            for selector in ["h3", "h3.base-search-card__title", ".base-card__title"]:
+                                try:
+                                    title = card.find_element(By.CSS_SELECTOR, selector).text.strip()
+                                    if title: break
+                                except: continue
+                            
+                            # 2. Fallback chain for Company
+                            company = ""
+                            for selector in ["h4", ".base-search-card__subtitle", ".job-search-card__subtitle"]:
+                                try:
+                                    company = card.find_element(By.CSS_SELECTOR, selector).text.strip()
+                                    if company: break
+                                except: continue
+
+                            # 3. URL and ID
+                            link_el = card.find_element(By.TAG_NAME, "a")
+                            full_url = link_el.get_attribute("href").split('?')[0]
+                            j_id = full_url.split('/')[-1].split('-')[-1]
+                            
+                            # 4. Location (Fallback to current 'loc' loop variable if not found on card)
+                            try:
+                                card_loc = card.find_element(By.CSS_SELECTOR, ".job-search-card__location, .base-search-card__metadata").text.strip()
+                            except:
+                                card_loc = loc
+
+                            # Only save if we have the core information
+                            if title and company:
+                                conn.execute("INSERT OR IGNORE INTO jobs VALUES (?, ?, ?, ?, ?, ?)",
+                                             (j_id, title, company, card_loc, full_url, datetime.now().date()))
+                                new_count += 1
+                        except: continue
+                    conn.commit()
+                print(f"LinkedIn Progress: '{kw}' in '{loc}' -> Scanned.")
+                
+    except Exception as e: 
+        print(f"LinkedIn Critical Error for User: {e}")
+        
+    return new_count
+def scrape_naukri(driver, user_params):
+    """
+    Naukri Scraper adapted for multiple users and multiple locations.
+    Uses 'user_params' to access specific DBs, Keywords, and Locations.
+    """
+    print(f"[3] Starting Naukri for Keywords: {user_params['KEYWORDS']}")
+    new_count = 0
+    
+    try:
+        # Loop through each keyword for the specific user
+        for kw in user_params["KEYWORDS"]:
+            # Loop through each location variation for the specific user
+            for loc in user_params["LOCATIONS"]:
+                
+                # Format URL: Naukri URLs typically use hyphens for spaces
+                # Example: python-developer-jobs-in-bangalore-urban
+                kw_url = kw.lower().replace(' ', '-')
+                loc_url = loc.lower().replace(' ', '-')
+                url = f"https://www.naukri.com/{kw_url}-jobs-in-{loc_url}"
+                
+                driver.get(url)
+                time.sleep(5) # Allow page to load
+                
+                # Identify job tuples
+                jobs = driver.find_elements(By.CLASS_NAME, "srp-jobtuple-wrapper")
+                
+                # Connect to this user's specific Naukri database
+                with sqlite3.connect(user_params["DB_NAUKRI"]) as conn:
+                    for job in jobs:
+                        try:
+                            # 1. Basic Info
+                            title_el = job.find_element(By.CSS_SELECTOR, "a.title")
+                            title = title_el.text.strip()
+                            link = title_el.get_attribute("href")
+                            comp = job.find_element(By.CSS_SELECTOR, ".comp-name").text.strip()
+                            
+                            # 2. High-density metadata capture (Exp, Sal, Loc)
+                            # Naukri uses spans next to specific icons
+                            meta = job.find_elements(By.CSS_SELECTOR, "span.ni-job-tuple-icon + span")
+                            exp = meta[0].text.strip() if len(meta) > 0 else "N/A"
+                            sal = meta[1].text.strip() if len(meta) > 1 else "N/A"
+                            # If card location is missing, use the 'loc' from our loop
+                            card_loc = meta[2].text.strip() if len(meta) > 2 else loc
+
+                            # 3. Unique ID for Naukri (since they don't have a simple numeric ID in URL)
+                            # Using a hash of the link ensures we don't duplicate the same URL
+                            j_id = f"nk_{hash(link)}"
+
+                            # 4. Save to User-specific Database
+                            conn.execute("INSERT OR IGNORE INTO jobs VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                         (j_id, title, comp, card_loc, sal, exp, link, datetime.now().date()))
+                            new_count += 1
+                        except:
+                            continue
+                    conn.commit()
+                print(f"Naukri Progress: '{kw}' in '{loc}' -> Scanned.")
+                
+    except Exception as e: 
+        print(f"Naukri Critical Error for User: {e}")
+        
+    return new_count
+def generate_report_and_mail(user_name, user_params):
+    """
+    Generates a personalized Excel report and sends an email 
+    using the specific database and credentials of the user.
+    """
+    print(f"[4] Finalizing Mail for {user_name}...")
+    today = datetime.now().date()
+    
+    # Connect to the specific user's databases
+    try:
+        with sqlite3.connect(user_params["DB_LINKEDIN"]) as c1, \
+             sqlite3.connect(user_params["DB_NAUKRI"]) as c2:
+            
+            df_l = pd.read_sql(f"SELECT * FROM jobs WHERE date_scraped='{today}'", c1)
+            df_n = pd.read_sql(f"SELECT * FROM jobs WHERE date_scraped='{today}'", c2)
+
+        if df_l.empty and df_n.empty: 
+            print(f"No new jobs to report for {user_name} today.")
+            return
+        
+        # Create a unique filename for the user to avoid overwriting files in the same folder
+        report_filename = f"Job_Report_{user_name}_{today}.xlsx"
+        
+        with pd.ExcelWriter(report_filename) as writer:
+            if not df_l.empty:
+                df_l.to_excel(writer, sheet_name='LinkedIn', index=False)
+            if not df_n.empty:
+                df_n.to_excel(writer, sheet_name='Naukri', index=False)
+
+        # Compose Email
+        msg = MIMEMultipart()
+        msg['Subject'] = f"Unified Job Report: {today} for {user_name}"
+        msg['From'] = user_params["GMAIL_USER"]
+        msg['To'] = user_params["GMAIL_USER"]
+        
+        body = f"Hello {user_name},\n\nExtraction complete for today.\n- LinkedIn: {len(df_l)} roles\n- Naukri: {len(df_n)} roles\n\nPlease find the attached report."
+        msg.attach(MIMEText(body, 'plain'))
+
+        # Attach the generated Excel file
+        with open(report_filename, "rb") as f:
+            part = MIMEApplication(f.read(), Name=report_filename)
+            part.add_header('Content-Disposition', 'attachment', filename=report_filename)
+            msg.attach(part)
+
+        # Send via SMTP
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(user_params["GMAIL_USER"], user_params["GMAIL_PASS"])
+            server.send_message(msg)
+            
+        print(f"Email successfully dispatched to {user_name} ({user_params['GMAIL_USER']}).")
+        
+        # Optional: Clean up the file after sending to keep the folder tidy
+        # os.remove(report_filename)
+
+    except Exception as e:
+        print(f"Reporting Error for {user_name}: {e}")
+def run_full_job_intelligence_suite():
+    """
+    The Master Function that coordinates the entire ETL process 
+    for all users defined in the configuration.
+    """
+    start_total = datetime.now()
+    print(f"\n{'='*60}")
+    print(f"SYSTEM START: {start_total.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'='*60}\n")
+
+    # Iterate through each user in your users_config dictionary
+    # name = "user1" or "user2"
+    # params = the dictionary containing their specific DBs and Keywords
+    for name, params in users_config.items():
+        try:
+            # 1. Reset/Initialize this specific user's DBs
+            init_dbs(params)
+            
+            # 2. Start the Browser Session
+            print(f"\n>>> Starting Session for User: {name}")
+            main_driver = get_shared_driver()
+
+            # 3. Run LinkedIn Scraper
+            # Passing (main_driver, params) ensures it uses the user's keywords/DB
+            l_count = scrape_linkedin(main_driver, params)
+            
+            # 4. Run Naukri Scraper
+            # Passing (main_driver, params) ensures it uses the user's keywords/DB
+            n_count = scrape_naukri(main_driver, params)
+            
+            # 5. Generate Excel and Send Email to this user
+            generate_report_and_mail(name, params)
+            
+            # 6. Print Daily Summary
+            db_summary(params)
+            
+            # 7. Print Historical Summary
+            historical_db_report(name, params)
+            
+            # 8. Close browser for this user
+            main_driver.quit()
+            print(f"\n[SUCCESS] Pipeline finished for {name}.")
+            
+            # 5-second cooldown to let the OS release file locks before the next user starts
+            time.sleep(5)
+
+        except Exception as e:
+            print(f"\n[FATAL ERROR] Pipeline failed for {name}: {e}")
+            if 'main_driver' in locals():
+                main_driver.quit()
+
+    end_total = datetime.now()
+    print(f"\n{'='*60}")
+    print(f"SYSTEM FINISHED at {end_total.strftime('%H:%M:%S')}")
+    print(f"TOTAL DURATION: {end_total - start_total}")
+    print(f"{'='*60}")
+if __name__ == "__main__":
+    run_full_job_intelligence_suite()
